@@ -10,7 +10,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::style::ProgressStyle;
 use crate::utils::{duration_to_secs, secs_to_duration, Estimate};
-use console::Term;
+use crate::tty;
 
 /// The drawn state of an element.
 #[derive(Clone, Debug)]
@@ -37,7 +37,7 @@ enum Status {
 }
 
 enum ProgressDrawTargetKind {
-    Term(Term, Option<ProgressDrawState>, Option<Duration>),
+    Term(Option<ProgressDrawState>, Option<Duration>),
     Remote(usize, Mutex<Sender<(usize, ProgressDrawState)>>),
     Hidden,
 }
@@ -50,6 +50,9 @@ enum ProgressDrawTargetKind {
 /// device.
 pub struct ProgressDrawTarget {
     kind: ProgressDrawTargetKind,
+    
+    /// Width of the terminal
+    pub width: usize,
 }
 
 impl ProgressDrawTarget {
@@ -57,7 +60,7 @@ impl ProgressDrawTarget {
     ///
     /// For more information see `ProgressDrawTarget::to_term`.
     pub fn stdout() -> ProgressDrawTarget {
-        ProgressDrawTarget::to_term(Term::buffered_stdout(), Some(15))
+        ProgressDrawTarget::to_term(Some(15))
     }
 
     /// Draw to a buffered stderr terminal at a max of 15 times a second.
@@ -65,7 +68,7 @@ impl ProgressDrawTarget {
     /// This is the default draw target for progress bars.  For more
     /// information see `ProgressDrawTarget::to_term`.
     pub fn stderr() -> ProgressDrawTarget {
-        ProgressDrawTarget::to_term(Term::buffered_stderr(), Some(15))
+        ProgressDrawTarget::to_term(Some(15))
     }
 
     /// Draw to a buffered stdout terminal without max framerate.
@@ -76,7 +79,7 @@ impl ProgressDrawTarget {
     ///
     /// For more information see `ProgressDrawTarget::to_term`.
     pub fn stdout_nohz() -> ProgressDrawTarget {
-        ProgressDrawTarget::to_term(Term::buffered_stdout(), None)
+        ProgressDrawTarget::to_term(None)
     }
 
     /// Draw to a buffered stderr terminal without max framerate.
@@ -87,7 +90,7 @@ impl ProgressDrawTarget {
     ///
     /// For more information see `ProgressDrawTarget::to_term`.
     pub fn stderr_nohz() -> ProgressDrawTarget {
-        ProgressDrawTarget::to_term(Term::buffered_stderr(), None)
+        ProgressDrawTarget::to_term(None)
     }
 
     /// Draw to a terminal, optionally with a specific refresh rate.
@@ -96,10 +99,11 @@ impl ProgressDrawTarget {
     /// terminal is not user attended the entire progress bar will be
     /// hidden.  This is done so that piping to a file will not produce
     /// useless escape codes in that file.
-    pub fn to_term(term: Term, refresh_rate: Option<u64>) -> ProgressDrawTarget {
+    pub fn to_term(refresh_rate: Option<u64>) -> ProgressDrawTarget {
         let rate = refresh_rate.map(|x| Duration::from_millis(1000 / x));
         ProgressDrawTarget {
-            kind: ProgressDrawTargetKind::Term(term, None, rate),
+            kind: ProgressDrawTargetKind::Term(None, rate),
+            width: tty::terminal_size().unwrap().0 as usize,
         }
     }
 
@@ -109,6 +113,7 @@ impl ProgressDrawTarget {
     pub fn hidden() -> ProgressDrawTarget {
         ProgressDrawTarget {
             kind: ProgressDrawTargetKind::Hidden,
+            width: 0,
         }
     }
 
@@ -119,19 +124,20 @@ impl ProgressDrawTarget {
     pub fn is_hidden(&self) -> bool {
         match self.kind {
             ProgressDrawTargetKind::Hidden => true,
-            ProgressDrawTargetKind::Term(ref term, ..) => !term.is_term(),
+            //ProgressDrawTargetKind::Term(ref term, ..) => !term.is_term(),
+            ProgressDrawTargetKind::Term(_, _) => false,
             _ => false,
         }
     }
 
     /// Apply the given draw state (draws it).
-    fn apply_draw_state(&mut self, draw_state: ProgressDrawState) -> io::Result<()> {
+    fn apply_draw_state(&mut self, mut draw_state: ProgressDrawState) -> io::Result<()> {
         // no need to apply anything to hidden draw targets.
         if self.is_hidden() {
             return Ok(());
         }
         match self.kind {
-            ProgressDrawTargetKind::Term(ref term, ref mut last_state, rate) => {
+            ProgressDrawTargetKind::Term(ref mut last_state, rate) => {
                 let last_draw = last_state.as_ref().map(|x| x.ts);
                 if draw_state.finished
                     || draw_state.force_draw
@@ -139,16 +145,15 @@ impl ProgressDrawTarget {
                     || last_draw.is_none()
                     || last_draw.unwrap().elapsed() > rate.unwrap()
                 {
-                    if let Some(ref last_state) = *last_state {
-                        if !draw_state.lines.is_empty() && draw_state.move_cursor {
-                            last_state.move_cursor(term)?;
-                        } else {
-                            last_state.clear_term(term)?;
-                        }
-                    }
-                    draw_state.draw_to_term(term)?;
-                    term.flush()?;
+                    tty::hide_cursor();
+                    let past = if let Some(ref mut last_state) = *last_state {
+                        last_state.move_cursor();
+                        last_state.lines.len() - last_state.orphan_lines
+                    } else {0};
+                    draw_state.draw_to_term(self.width, past);
+                    //term.flush()?;
                     *last_state = Some(draw_state);
+                    tty::show_cursor();
                 }
             }
             ProgressDrawTargetKind::Remote(idx, ref chan) => {
@@ -162,7 +167,7 @@ impl ProgressDrawTarget {
     /// Properly disconnects from the draw target
     fn disconnect(&self) {
         match self.kind {
-            ProgressDrawTargetKind::Term(_, _, _) => {}
+            ProgressDrawTargetKind::Term(_, _) => {}
             ProgressDrawTargetKind::Remote(idx, ref chan) => {
                 chan.lock()
                     .send((
@@ -184,19 +189,32 @@ impl ProgressDrawTarget {
 }
 
 impl ProgressDrawState {
-    pub fn clear_term(&self, term: &Term) -> io::Result<()> {
-        term.clear_last_lines(self.lines.len() - self.orphan_lines)
-    }
-
-    pub fn move_cursor(&self, term: &Term) -> io::Result<()> {
-        term.move_cursor_up(self.lines.len() - self.orphan_lines)
-    }
-
-    pub fn draw_to_term(&self, term: &Term) -> io::Result<()> {
-        for line in &self.lines {
-            term.write_line(line)?;
+    pub fn clear_term(&mut self, width: usize) {
+        //term.clear_last_lines(self.lines.len() - self.orphan_lines)
+        let n = self.lines.len() - self.orphan_lines;
+        tty::move_cursor_up(n);
+        for _ in 0..n {
+            println!("{}", std::iter::repeat(' ').take(width).collect::<String>())
         }
-        Ok(())
+        tty::move_cursor_up(n);
+    }
+
+    pub fn move_cursor(&mut self) {
+        tty::move_cursor_up(self.lines.len() - self.orphan_lines);
+    }
+
+    pub fn draw_to_term(&mut self, width: usize, past: usize) {
+        for line in &self.lines {
+            let n = if (width as i16 - line.len() as i16) < 0 {0} else {width - line.len()};
+            let padding = std::iter::repeat(' ').take(n).collect::<String>();
+            println!("{}{}", line, padding);
+        }
+        if past > self.lines.len() { 
+            for _ in 0..(past - self.lines.len()) {
+                println!("{}", std::iter::repeat(' ').take(width).collect::<String>());
+            }
+            tty::move_cursor_up(past - self.lines.len());
+        }
     }
 }
 
@@ -284,7 +302,7 @@ impl ProgressState {
         if let Some(width) = self.width {
             width as usize
         } else {
-            Term::stderr().size().1 as usize
+            tty::terminal_size().unwrap().0 as usize
         }
     }
 
@@ -800,6 +818,7 @@ impl MultiProgress {
         });
         pb.set_draw_target(ProgressDrawTarget {
             kind: ProgressDrawTargetKind::Remote(idx, Mutex::new(self.tx.clone())),
+            width: 0,
         });
         pb
     }

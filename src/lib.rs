@@ -185,6 +185,7 @@ mod iter;
 mod progress;
 mod style;
 mod utils;
+mod tty;
 
 pub use crate::format::{BinaryBytes, DecimalBytes, FormattedDuration, HumanBytes, HumanDuration};
 pub use crate::iter::{ProgressBarIter, ProgressIterator};
