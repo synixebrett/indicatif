@@ -583,7 +583,7 @@ impl ProgressBar {
     /// Finishes the progress bar and leaves the current message.
     pub fn finish(&self) {
         self.update_and_draw(|state| {
-            state.pos = state.len;
+            //state.pos = state.len;
             state.draw_next = state.pos;
             state.status = Status::DoneVisible;
         });
@@ -594,7 +594,7 @@ impl ProgressBar {
         let msg = msg.to_string();
         self.update_and_draw(|state| {
             state.message = msg;
-            state.pos = state.len;
+            //state.pos = state.len;
             state.draw_next = state.pos;
             state.status = Status::DoneVisible;
         });
@@ -603,7 +603,7 @@ impl ProgressBar {
     /// Finishes the progress bar and completely clears it.
     pub fn finish_and_clear(&self) {
         self.update_and_draw(|state| {
-            state.pos = state.len;
+            //state.pos = state.len;
             state.draw_next = state.pos;
             state.status = Status::DoneHidden;
         });
